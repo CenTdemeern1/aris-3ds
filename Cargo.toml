@@ -1,0 +1,11 @@
+[package]
+name = "aris"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ctru-rs = { git = "https://github.com/rust3ds/ctru-rs" }
+qoi = "0.4.1"
+
+[package.metadata.cargo-3ds]
+romfs_dir = "romfs"
