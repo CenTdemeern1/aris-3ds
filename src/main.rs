@@ -1,6 +1,6 @@
 #![feature(allocator_api)]
 
-use std::{io::Read, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}};
+use std::{sync::atomic::{AtomicBool, Ordering}, thread::JoinHandle, time::{Duration, Instant}};
 
 use ctru::{
     linear::LinearAllocator, prelude::*, services::{
@@ -10,41 +10,44 @@ use ctru::{
 };
 
 const FRAME_DURATION: Duration = Duration::new(0, 41666666); // 1 / 24
+const AUDIO_CHUNK_SIZE: usize = 48000;
 static RUN_AUDIO_THREAD: AtomicBool = AtomicBool::new(true);
 
 fn main() {
     let apt = Apt::new().unwrap();
     let mut hid = Hid::new().unwrap();
     let gfx = Gfx::new().unwrap();
-    let ndsp = Ndsp::new();
     let _console = Console::new(gfx.top_screen.borrow_mut());
-
-    let audio_thread_join_handle = if let Ok(ndsp) = ndsp {
-        Some(std::thread::spawn(|| {
-            while RUN_AUDIO_THREAD.load(Ordering::Relaxed) {
-                // Buffer size should be 24431616, but that's too big I'm going to have to do some buffer manipulation here maybe
-                let mut usagi_flap_pcm: Box<[u8], LinearAllocator> = Box::new_in([0u8; 1048576], LinearAllocator);
-                std::fs::File::open("romfs:/usagi-flap.pcm").unwrap().read_exact(&mut usagi_flap_pcm).unwrap();
-                let mut usagi_flap = Wave::new(
-                    usagi_flap_pcm,
-                    AudioFormat::PCM16Stereo,
-                    true
-                );
-                ndsp.set_output_mode(OutputMode::Stereo);
-                let mut channel = ndsp.channel(0).unwrap();
-                channel.set_format(AudioFormat::PCM16Stereo);
-                channel.set_interpolation(InterpolationType::None);
-                channel.set_sample_rate(48000.);
-                channel.queue_wave(&mut usagi_flap).unwrap();
-            }
-        }))
-    } else {
-        println!("\x1b[33mWarning: NDSP firmware not found.\nContinuing without sound.\x1b[0m");
-        None
-    };
 
     println!("Decoding...");
     let decode_start = Instant::now();
+
+    let audio_thread_join_handle: JoinHandle<()> = std::thread::spawn(|| {
+        if let Ok(mut ndsp) = Ndsp::new() {
+            let mut usagi_flap_file = std::fs::read("romfs:/usagi-flap.pcm").unwrap();
+            let mut current_position = 0usize;
+            ndsp.set_output_mode(OutputMode::Stereo);
+            let mut channel = ndsp.channel(0).unwrap();
+            channel.set_format(AudioFormat::PCM16Stereo);
+            channel.set_interpolation(InterpolationType::None);
+            channel.set_sample_rate(48000.);
+            while RUN_AUDIO_THREAD.load(Ordering::Relaxed) {
+                // Buffer size should be 24431616, but that's too big I'm going to have to do some buffer manipulation here maybe
+                let slice: [u8; AUDIO_CHUNK_SIZE] = usagi_flap_file[current_position..(current_position + AUDIO_CHUNK_SIZE)].try_into().unwrap();
+                let mut usagi_flap_pcm: Box<[u8], LinearAllocator> = Box::new_in(slice, LinearAllocator);
+                current_position += AUDIO_CHUNK_SIZE;
+                let mut usagi_flap = Wave::new(
+                    usagi_flap_pcm,
+                    AudioFormat::PCM16Stereo,
+                    false
+                );
+                channel.queue_wave(&mut usagi_flap).unwrap();
+            }
+        } else {
+            println!("\x1b[33mWarning: NDSP firmware not found.\nContinuing without sound.\x1b[0m");
+        }
+    });
+
     let _romfs = ctru::services::romfs::RomFS::new().unwrap();
 
     let mut aris_frames_decoded: Vec<Box<[u8]>> = Vec::with_capacity(17);
@@ -100,8 +103,6 @@ fn main() {
         std::thread::sleep(FRAME_DURATION - frame_duration);
     }
 
-    if Some(audio_thread_join_handle) = audio_thread_join_handle {
-        RUN_AUDIO_THREAD.store(false, Ordering::Relaxed);
-        audio_thread_join_handle.join(); // Make sure the thread can exit because of the co-operative threading model
-    }
+    RUN_AUDIO_THREAD.store(false, Ordering::Relaxed);
+    audio_thread_join_handle.join().unwrap(); // Make sure the thread can exit because of the co-operative threading model
 }
