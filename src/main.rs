@@ -1,11 +1,11 @@
 #![feature(allocator_api)]
 
-use std::{sync::atomic::{AtomicBool, Ordering}, thread::JoinHandle, time::{Duration, Instant}};
+use std::{fs::File, io::{Read, Seek}, sync::atomic::{AtomicBool, Ordering}, thread::JoinHandle, time::{Duration, Instant}};
 
 use ctru::{
     linear::LinearAllocator, prelude::*, services::{
         gfx::{Flush, Screen, Swap},
-        ndsp::{wave::Wave, AudioFormat, InterpolationType, Ndsp, OutputMode}
+        ndsp::{wave::{Status, Wave}, AudioFormat, AudioMix, InterpolationType, Ndsp, OutputMode}
     }
 };
 
@@ -13,42 +13,70 @@ const FRAME_DURATION: Duration = Duration::new(0, 41666666); // 1 / 24
 const AUDIO_CHUNK_SIZE: usize = 48000;
 static RUN_AUDIO_THREAD: AtomicBool = AtomicBool::new(true);
 
+fn fill_audio_buffer_from_file(buffer: &mut [u8], file: &mut File) {
+    if file.read(buffer).unwrap() == 0 {
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.read(buffer).unwrap();
+    }
+}
+
 fn main() {
     let apt = Apt::new().unwrap();
     let mut hid = Hid::new().unwrap();
     let gfx = Gfx::new().unwrap();
     let _console = Console::new(gfx.top_screen.borrow_mut());
+    let _romfs = ctru::services::romfs::RomFS::new().unwrap();
 
     println!("Decoding...");
     let decode_start = Instant::now();
 
     let audio_thread_join_handle: JoinHandle<()> = std::thread::spawn(|| {
         if let Ok(mut ndsp) = Ndsp::new() {
-            let mut usagi_flap_file = std::fs::read("romfs:/usagi-flap.pcm").unwrap();
-            let mut current_position = 0usize;
+            let mut usagi_flap_file = std::fs::File::open("romfs:/usagi-flap.pcm").unwrap();
             ndsp.set_output_mode(OutputMode::Stereo);
             let mut channel = ndsp.channel(0).unwrap();
             channel.set_format(AudioFormat::PCM16Stereo);
-            channel.set_interpolation(InterpolationType::None);
+            channel.set_interpolation(InterpolationType::Linear);
             channel.set_sample_rate(48000.);
-            while RUN_AUDIO_THREAD.load(Ordering::Relaxed) {
-                // Buffer size should be 24431616, but that's too big I'm going to have to do some buffer manipulation here maybe
-                let slice: [u8; AUDIO_CHUNK_SIZE] = usagi_flap_file[current_position..(current_position + AUDIO_CHUNK_SIZE)].try_into().unwrap();
-                let mut usagi_flap_pcm: Box<[u8], LinearAllocator> = Box::new_in(slice, LinearAllocator);
-                current_position += AUDIO_CHUNK_SIZE;
-                let mut usagi_flap = Wave::new(
-                    usagi_flap_pcm,
+            let mix = AudioMix::default();
+            channel.set_mix(&mix);
+            let mut audio_pcm: [[u8; AUDIO_CHUNK_SIZE]; 2] = [[0u8; AUDIO_CHUNK_SIZE]; 2];
+            fill_audio_buffer_from_file(&mut audio_pcm[0], &mut usagi_flap_file);
+            fill_audio_buffer_from_file(&mut audio_pcm[1], &mut usagi_flap_file);
+            let mut audio_pcm: [Wave; 2] = [
+                Wave::new(
+                    Box::new_in(audio_pcm[0], LinearAllocator),
                     AudioFormat::PCM16Stereo,
                     false
-                );
-                channel.queue_wave(&mut usagi_flap).unwrap();
+                ),
+                Wave::new(
+                    Box::new_in(audio_pcm[1], LinearAllocator),
+                    AudioFormat::PCM16Stereo,
+                    false
+                )
+            ];
+            channel.queue_wave(&mut audio_pcm[0]).unwrap();
+            channel.queue_wave(&mut audio_pcm[1]).unwrap();
+            let mut buffer_to_use = 0usize;
+            while RUN_AUDIO_THREAD.load(Ordering::Relaxed) {
+                let current = &mut audio_pcm[buffer_to_use];
+                if let Status::Done = current.status() {
+                    // Get audio data from file and put it in the buffer!
+                    let mutable_buffer = current.get_buffer_mut().unwrap();
+                    fill_audio_buffer_from_file(mutable_buffer, &mut usagi_flap_file);
+                    // Queue the buffer!
+                    channel.queue_wave(current).unwrap();
+                    // Change which buffer to fill next!
+                    buffer_to_use += 1;
+                    // Make sure it doesn't increase beyond the amount of buffers
+                    // This means we can triple buffer, or quadruple buffer if you really want to
+                    buffer_to_use %= audio_pcm.len();
+                }
             }
         } else {
             println!("\x1b[33mWarning: NDSP firmware not found.\nContinuing without sound.\x1b[0m");
         }
     });
-
-    let _romfs = ctru::services::romfs::RomFS::new().unwrap();
 
     let mut aris_frames_decoded: Vec<Box<[u8]>> = Vec::with_capacity(17);
     for frame in 0..=16 {
