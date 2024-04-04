@@ -1,6 +1,6 @@
 #![feature(allocator_api)]
 
-use std::{fs::File, io::{Read, Seek}, sync::atomic::{AtomicBool, Ordering}, thread::JoinHandle, time::{Duration, Instant}};
+use std::{fs::File, io::{Read, Seek}, sync::{atomic::{AtomicBool, Ordering}, Arc, Barrier}, thread::{sleep, JoinHandle}, time::{Duration, Instant}};
 
 use ctru::{
     linear::LinearAllocator, prelude::*, services::{
@@ -10,7 +10,8 @@ use ctru::{
 };
 
 const FRAME_DURATION: Duration = Duration::new(0, 41666666); // 1 / 24
-const AUDIO_CHUNK_SIZE: usize = 48000;
+const AUDIO_CHUNK_SIZE: usize = 48000; // One fourth of a second's worth of audio samples
+const AUDIO_CHECK_INTERVAL: Duration = Duration::new(0, 125000000); // 1 / 8
 static RUN_AUDIO_THREAD: AtomicBool = AtomicBool::new(true);
 
 fn fill_audio_buffer_from_file(buffer: &mut [u8], file: &mut File) {
@@ -30,7 +31,10 @@ fn main() {
     println!("Decoding...");
     let decode_start = Instant::now();
 
-    let audio_thread_join_handle: JoinHandle<()> = std::thread::spawn(|| {
+    let barrier = Arc::new(Barrier::new(2));
+    let thread_barrier = barrier.clone();
+
+    let audio_thread_join_handle: JoinHandle<()> = std::thread::spawn(move || {
         if let Ok(mut ndsp) = Ndsp::new() {
             let mut usagi_flap_file = std::fs::File::open("romfs:/usagi-flap.pcm").unwrap();
             ndsp.set_output_mode(OutputMode::Stereo);
@@ -55,10 +59,12 @@ fn main() {
                     false
                 )
             ];
+            thread_barrier.wait();
             channel.queue_wave(&mut audio_pcm[0]).unwrap();
             channel.queue_wave(&mut audio_pcm[1]).unwrap();
             let mut buffer_to_use = 0usize;
             while RUN_AUDIO_THREAD.load(Ordering::Relaxed) {
+                sleep(AUDIO_CHECK_INTERVAL);
                 let current = &mut audio_pcm[buffer_to_use];
                 if let Status::Done = current.status() {
                     // Get audio data from file and put it in the buffer!
@@ -75,6 +81,7 @@ fn main() {
             }
         } else {
             println!("\x1b[33mWarning: NDSP firmware not found.\nContinuing without sound.\x1b[0m");
+            thread_barrier.wait();
         }
     });
 
@@ -89,6 +96,9 @@ fn main() {
         ).unwrap();
         aris_frames_decoded.push(aris_frame);
     }
+
+    barrier.wait();
+
     let decode_end = Instant::now();
     let decode_length = decode_end.duration_since(decode_start);
     println!("Decoding done! Took {} secs.", decode_length.as_secs_f64());
@@ -116,7 +126,7 @@ fn main() {
                 .ptr
                 .copy_from(aris.as_ptr(), aris.len());
         }
-
+        
         bottom_screen.flush_buffers();
         gfx.wait_for_vblank();
         bottom_screen.swap_buffers();
@@ -128,7 +138,7 @@ fn main() {
 
         let frame_end = Instant::now();
         let frame_duration = frame_end.duration_since(frame_start);
-        std::thread::sleep(FRAME_DURATION - frame_duration);
+        sleep(FRAME_DURATION.saturating_sub(frame_duration));
     }
 
     RUN_AUDIO_THREAD.store(false, Ordering::Relaxed);
