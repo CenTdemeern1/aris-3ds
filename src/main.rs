@@ -64,7 +64,11 @@ fn main() {
             channel.queue_wave(&mut audio_pcm[1]).unwrap();
             let mut buffer_to_use = 0usize;
             while RUN_AUDIO_THREAD.load(Ordering::Relaxed) {
-                sleep(AUDIO_CHECK_INTERVAL);
+                // IMPORTANT: The all important yield_now!
+                // Commenting out both the yield_now and the sleep will make the application run slow and deadlock the system when pressing the HOME button.
+                // Having either one uncommented actually makes the thread yield correctly resolving both the aforementioned problems.
+                // sleep(AUDIO_CHECK_INTERVAL);
+                std::thread::yield_now();
                 let current = &mut audio_pcm[buffer_to_use];
                 if let Status::Done = current.status() {
                     // Get audio data from file and put it in the buffer!
